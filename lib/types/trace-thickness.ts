@@ -1,67 +1,79 @@
 /**
- * Trace thickness definitions for the autorouter.
+ * Trace thickness types and utilities for the autorouter.
  *
- * The industry standard data-line trace width is 0.15mm.
- * We support multiples of this base width for power traces:
- *   - 1x  → 0.15mm  (standard data line)
- *   - 2x  → 0.30mm
- *   - 4x  → 0.60mm
- *   - 8x  → 1.20mm
+ * The industry-standard data line thickness is 0.15mm.
+ * We support 1x, 2x, 4x and 8x multiples for power routing:
+ *   - 0.15mm (1x) — standard signal trace
+ *   - 0.30mm (2x) — light power trace
+ *   - 0.60mm (4x) — medium power trace
+ *   - 1.20mm (8x) — heavy power / bus trace
  */
 
-export const TRACE_BASE_WIDTH_MM = 0.15;
+export const STANDARD_TRACE_THICKNESS_MM = 0.15
 
-export type TraceThicknessMultiple = 1 | 2 | 4 | 8;
+export type TraceThicknessMultiple = 1 | 2 | 4 | 8
 
-export const TRACE_THICKNESS_MULTIPLES: TraceThicknessMultiple[] = [1, 2, 4, 8];
+export const TRACE_THICKNESS_MULTIPLES: TraceThicknessMultiple[] = [1, 2, 4, 8]
 
-export interface TraceThicknessConfig {
-  /** Multiplier relative to the base trace width (0.15mm). Default: 1 */
-  widthMultiple?: TraceThicknessMultiple;
-  /** Explicit width in mm. Overrides widthMultiple when set. */
-  widthMm?: number;
+export const TRACE_THICKNESS_MM: Record<TraceThicknessMultiple, number> = {
+  1: 0.15,
+  2: 0.30,
+  4: 0.60,
+  8: 1.20,
 }
 
 /**
- * Resolve a TraceThicknessConfig (or a raw mm value) to an actual mm width.
- * Falls back to the base width when nothing is specified.
+ * Given a thickness in mm, return the closest supported multiple.
+ * Rounds to the nearest supported multiple (1x, 2x, 4x, 8x).
  */
-export function resolveTraceWidth(
-  config?: TraceThicknessConfig | number | null,
-): number {
-  if (config === undefined || config === null) {
-    return TRACE_BASE_WIDTH_MM;
-  }
-  if (typeof config === "number") {
-    return config > 0 ? config : TRACE_BASE_WIDTH_MM;
-  }
-  if (config.widthMm !== undefined && config.widthMm > 0) {
-    return config.widthMm;
-  }
-  if (config.widthMultiple !== undefined) {
-    return TRACE_BASE_WIDTH_MM * config.widthMultiple;
-  }
-  return TRACE_BASE_WIDTH_MM;
-}
-
-/**
- * Given a desired width in mm, return the nearest supported multiple
- * (rounding up to ensure we never under-spec a power trace).
- */
-export function nearestSupportedMultiple(
-  widthMm: number,
+export function getTraceThicknessMultiple(
+  thicknessMm: number,
 ): TraceThicknessMultiple {
-  const ratio = widthMm / TRACE_BASE_WIDTH_MM;
-  // Round up and clamp to valid multiples
-  for (const m of TRACE_THICKNESS_MULTIPLES) {
-    if (m >= ratio) return m;
-  }
-  return 8;
+  const ratio = thicknessMm / STANDARD_TRACE_THICKNESS_MM
+  if (ratio <= 1.5) return 1
+  if (ratio <= 3) return 2
+  if (ratio <= 6) return 4
+  return 8
 }
 
 /**
- * Half-width helper (used extensively in clearance / obstacle calculations).
+ * Convert a thickness multiple to mm.
  */
-export function traceHalfWidth(widthMm: number): number {
-  return widthMm / 2;
+export function traceThicknessMultipleToMm(
+  multiple: TraceThicknessMultiple,
+): number {
+  return TRACE_THICKNESS_MM[multiple]
+}
+
+/**
+ * Return the half-width (radius) of a trace in mm.
+ * Used for clearance / obstacle inflation calculations.
+ */
+export function traceHalfWidth(thicknessMm: number): number {
+  return thicknessMm / 2
+}
+
+/**
+ * Compute the minimum clearance needed between two traces of given thicknesses.
+ * IPC-2221 minimum clearance for internal layers is 0.1mm; we use that as floor.
+ */
+export function minClearanceBetweenTraces(
+  aThicknessMm: number,
+  bThicknessMm: number,
+): number {
+  const IPC_MIN_CLEARANCE_MM = 0.1
+  return aThicknessMm / 2 + bThicknessMm / 2 + IPC_MIN_CLEARANCE_MM
+}
+
+/**
+ * Compute the effective obstacle inflation radius for a trace of given thickness
+ * routing next to an obstacle (pad, via, other trace).
+ * The obstacle itself has radius `obstacleRadiusMm`.
+ */
+export function obstacleInflationRadius(
+  traceThicknessMm: number,
+  obstacleRadiusMm: number,
+): number {
+  const IPC_MIN_CLEARANCE_MM = 0.1
+  return traceThicknessMm / 2 + obstacleRadiusMm + IPC_MIN_CLEARANCE_MM
 }
