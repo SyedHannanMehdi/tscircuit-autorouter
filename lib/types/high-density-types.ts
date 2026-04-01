@@ -5,6 +5,12 @@ export type PortPoint = {
   x: number
   y: number
   z: number
+  /**
+   * Optional nominal trace width for this connection, overriding the default.
+   * Supports multiples of the standard 0.15mm trace: 0.3mm (2x), 0.6mm (4x),
+   * 1.2mm (8x).
+   */
+  nominalTraceWidth?: number
 }
 
 export type NodeWithPortPoints = {
