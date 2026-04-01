@@ -89,6 +89,8 @@ export class NetToPointPairsSolver extends BaseSolver {
         rootConnectionName: connection.name,
         mergedConnectionNames: connection.mergedConnectionNames,
         netConnectionName: connection.netConnectionName,
+        // Propagate nominalTraceWidth so per-connection trace thickness works
+        nominalTraceWidth: connection.nominalTraceWidth,
       })
     }
   }
