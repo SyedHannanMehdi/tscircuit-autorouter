@@ -2,6 +2,7 @@ import { ConnectivityMap } from "circuit-json-to-connectivity-map"
 import type { GraphicsObject } from "graphics-debug"
 import { getGlobalInMemoryCache } from "lib/cache/setupGlobalCaches"
 import type { CapacityMeshNodeId } from "lib/types/capacity-mesh-types"
+import { SimpleRouteConnection } from "lib/types"
 import { combineVisualizations } from "lib/utils/combineVisualizations"
 import { mergeRouteSegments } from "lib/utils/mergeRouteSegments"
 import type {
@@ -32,9 +33,8 @@ export class HighDensitySolver extends BaseSolver {
   effort: number
 
   /**
-   * Per-connection nominal trace widths. When a connection name is found here,
-   * its value is used as the traceWidth for that connection's intra-node
-   * routing. The rootConnectionName is also checked as a fallback.
+   * Per-connection trace width overrides, keyed by connection name or root
+   * connection name. Built from the connections' nominalTraceWidth field.
    */
   connectionTraceWidthMap: Map<string, number>
 
@@ -65,7 +65,7 @@ export class HighDensitySolver extends BaseSolver {
     obstacleMargin,
     effort,
     nodePfById,
-    connectionTraceWidthMap,
+    connections,
   }: {
     nodePortPoints: NodeWithPortPoints[]
     colorMap?: Record<string, string>
@@ -77,14 +77,7 @@ export class HighDensitySolver extends BaseSolver {
     nodePfById?:
       | Map<CapacityMeshNodeId, number | null>
       | Record<string, number | null>
-    /**
-     * Optional map from connection name to nominal trace width. Used to route
-     * power traces etc. at a wider width than the default minTraceWidth.
-     */
-    connectionTraceWidthMap?:
-      | Map<string, number>
-      | Record<string, number>
-      | null
+    connections?: SimpleRouteConnection[]
   }) {
     super()
     this.unsolvedNodePortPoints = nodePortPoints
@@ -107,14 +100,28 @@ export class HighDensitySolver extends BaseSolver {
       difficultNodePfs: {} as Record<string, number[]>,
     }
 
-    if (connectionTraceWidthMap instanceof Map) {
-      this.connectionTraceWidthMap = new Map(connectionTraceWidthMap)
-    } else if (connectionTraceWidthMap) {
-      this.connectionTraceWidthMap = new Map(
-        Object.entries(connectionTraceWidthMap),
-      )
-    } else {
-      this.connectionTraceWidthMap = new Map()
+    // Build per-connection trace width map from connections' nominalTraceWidth
+    this.connectionTraceWidthMap = new Map()
+    if (connections) {
+      for (const connection of connections) {
+        if (connection.nominalTraceWidth !== undefined) {
+          this.connectionTraceWidthMap.set(
+            connection.name,
+            connection.nominalTraceWidth,
+          )
+          // Also index by rootConnectionName so MST sub-connections resolve
+          if (connection.rootConnectionName) {
+            if (
+              !this.connectionTraceWidthMap.has(connection.rootConnectionName)
+            ) {
+              this.connectionTraceWidthMap.set(
+                connection.rootConnectionName,
+                connection.nominalTraceWidth,
+              )
+            }
+          }
+        }
+      }
     }
   }
 
@@ -239,42 +246,6 @@ export class HighDensitySolver extends BaseSolver {
   }
 
   /**
-   * Compute the effective trace width for a given node. If all port points in
-   * the node belong to the same connection that has a nominalTraceWidth, use
-   * that. Otherwise fall back to the global traceWidth.
-   *
-   * For nodes with mixed connections we use the maximum requested width so that
-   * the wider trace gets the space it needs (the TraceWidthSolver will narrow
-   * traces that don't fit later).
-   */
-  private getTraceWidthForNode(node: NodeWithPortPoints): number {
-    if (this.connectionTraceWidthMap.size === 0) {
-      return this.traceWidth
-    }
-
-    let maxWidth = this.traceWidth
-    const seen = new Set<string>()
-
-    for (const portPoint of node.portPoints) {
-      const key = portPoint.rootConnectionName ?? portPoint.connectionName
-      if (seen.has(key)) continue
-      seen.add(key)
-
-      const byName = this.connectionTraceWidthMap.get(portPoint.connectionName)
-      const byRoot = portPoint.rootConnectionName
-        ? this.connectionTraceWidthMap.get(portPoint.rootConnectionName)
-        : undefined
-
-      const w = byName ?? byRoot
-      if (w !== undefined && w > maxWidth) {
-        maxWidth = w
-      }
-    }
-
-    return maxWidth
-  }
-
-  /**
    * Each iteration, pop an unsolved node and attempt to find the routes inside
    * of it.
    */
@@ -302,59 +273,100 @@ export class HighDensitySolver extends BaseSolver {
       if (this.failedSolvers.length > 0) {
         this.solved = false
         this.failed = true
+        this.error = `${this.failedSolvers.length} nodes failed to route`
       } else {
         this.solved = true
       }
       return
     }
 
-    const node = this.unsolvedNodePortPoints.shift()!
-    const nodeTraceWidth = this.getTraceWidthForNode(node)
-    const nodePf = this.nodePfById.get(node.capacityMeshNodeId) ?? null
+    const nodePortPoints = this.unsolvedNodePortPoints.shift()!
 
     const cache = getGlobalInMemoryCache()
 
-    this.activeSubSolver = new CachedIntraNodeRouteSolver({
-      nodeWithPortPoints: node,
-      colorMap: this.colorMap,
-      connMap: this.connMap,
-      viaDiameter: this.viaDiameter,
-      traceWidth: nodeTraceWidth,
-      obstacleMargin: this.obstacleMargin,
-      effort: this.effort,
-      nodePf: nodePf ?? undefined,
-      cache,
-      connectionTraceWidthMap: this.connectionTraceWidthMap,
-    })
+    if (cache) {
+      this.activeSubSolver = new CachedIntraNodeRouteSolver({
+        nodeWithPortPoints: nodePortPoints,
+        colorMap: this.colorMap,
+        connMap: this.connMap,
+        viaDiameter: this.viaDiameter,
+        traceWidth: this.traceWidth,
+        obstacleMargin: this.obstacleMargin,
+        connectionTraceWidthMap: this.connectionTraceWidthMap,
+      })
+    } else {
+      this.activeSubSolver = new IntraNodeRouteSolver({
+        nodeWithPortPoints: nodePortPoints,
+        colorMap: this.colorMap,
+        connMap: this.connMap,
+        viaDiameter: this.viaDiameter,
+        traceWidth: this.traceWidth,
+        obstacleMargin: this.obstacleMargin,
+        connectionTraceWidthMap: this.connectionTraceWidthMap,
+      })
+    }
   }
 
-  override visualize(): GraphicsObject {
-    const visualizations: GraphicsObject[] = []
+  updateCacheStats() {
+    if (this.activeSubSolver instanceof CachedIntraNodeRouteSolver) {
+      const stats = this.stats as any
+      stats.cacheHits = (stats.cacheHits ?? 0) + (this.activeSubSolver.cacheHit ? 1 : 0)
+    }
+  }
 
-    for (const [capacityMeshNodeId, metadata] of this.nodeSolveMetadataById) {
-      const node = metadata.node
-      const color =
-        metadata.status === "solved"
-          ? safeTransparentize("green", 0.9)
-          : safeTransparentize("red", 0.9)
+  visualize(): GraphicsObject {
+    const graphics: GraphicsObject = {
+      points: [],
+      lines: [],
+      circles: [],
+      rects: [],
+      title: "High Density Solver",
+    }
 
-      visualizations.push({
-        rects: [
-          {
-            center: node.center,
-            width: node.width,
-            height: node.height,
-            color,
-            label: this.createNodeMarkerLabel(capacityMeshNodeId, metadata),
-          },
-        ],
+    for (const route of this.routes) {
+      const color = this.colorMap[route.connectionName] ?? "green"
+      for (let i = 0; i < route.route.length - 1; i++) {
+        const p1 = route.route[i]
+        const p2 = route.route[i + 1]
+        graphics.lines!.push({
+          points: [
+            { x: p1.x, y: p1.y },
+            { x: p2.x, y: p2.y },
+          ],
+          strokeColor:
+            p1.z !== 0 ? safeTransparentize(color, 0.5) : color,
+          strokeWidth: route.traceThickness,
+        })
+      }
+      for (const via of route.vias ?? []) {
+        graphics.circles!.push({
+          x: via.x,
+          y: via.y,
+          radius: this.viaDiameter / 2,
+          fill: color,
+        })
+      }
+    }
+
+    // Show node solve metadata as labels
+    for (const [
+      capacityMeshNodeId,
+      metadata,
+    ] of this.nodeSolveMetadataById.entries()) {
+      const label = this.createNodeMarkerLabel(capacityMeshNodeId, metadata)
+      const color = metadata.status === "solved" ? "green" : "red"
+      graphics.points!.push({
+        x: metadata.node.center.x,
+        y: metadata.node.center.y,
+        color,
+        label,
       })
     }
 
-    const routeVisualization = combineVisualizations(
-      ...(this.routes.map((r) => mergeRouteSegments([r])) ?? []),
-    )
+    if (this.activeSubSolver) {
+      return combineVisualizations(graphics, this.activeSubSolver.visualize())
+    }
 
-    return combineVisualizations(routeVisualization, ...visualizations)
+    return graphics
   }
 }
