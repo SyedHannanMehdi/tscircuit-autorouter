@@ -28,7 +28,15 @@ export class HighDensitySolver extends BaseSolver {
   readonly defaultTraceThickness = 0.15
   viaDiameter: number
   traceWidth: number
+  obstacleMargin: number
   effort: number
+
+  /**
+   * Per-connection nominal trace widths. When a connection name is found here,
+   * its value is used as the traceWidth for that connection's intra-node
+   * routing. The rootConnectionName is also checked as a fallback.
+   */
+  connectionTraceWidthMap: Map<string, number>
 
   failedSolvers: (IntraNodeRouteSolver | HyperSingleIntraNodeSolver)[]
   activeSubSolver: IntraNodeRouteSolver | HyperSingleIntraNodeSolver | null =
@@ -54,18 +62,29 @@ export class HighDensitySolver extends BaseSolver {
     connMap,
     viaDiameter,
     traceWidth,
+    obstacleMargin,
     effort,
     nodePfById,
+    connectionTraceWidthMap,
   }: {
     nodePortPoints: NodeWithPortPoints[]
     colorMap?: Record<string, string>
     connMap?: ConnectivityMap
     viaDiameter?: number
     traceWidth?: number
+    obstacleMargin?: number
     effort?: number
     nodePfById?:
       | Map<CapacityMeshNodeId, number | null>
       | Record<string, number | null>
+    /**
+     * Optional map from connection name to nominal trace width. Used to route
+     * power traces etc. at a wider width than the default minTraceWidth.
+     */
+    connectionTraceWidthMap?:
+      | Map<string, number>
+      | Record<string, number>
+      | null
   }) {
     super()
     this.unsolvedNodePortPoints = nodePortPoints
@@ -77,6 +96,7 @@ export class HighDensitySolver extends BaseSolver {
     this.MAX_ITERATIONS = 10e6 * this.effort
     this.viaDiameter = viaDiameter ?? this.defaultViaDiameter
     this.traceWidth = traceWidth ?? this.defaultTraceThickness
+    this.obstacleMargin = obstacleMargin ?? 0.15
     this.nodePfById =
       nodePfById instanceof Map
         ? new Map(nodePfById)
@@ -85,6 +105,16 @@ export class HighDensitySolver extends BaseSolver {
     this.stats = {
       solverNodeCount: {} as Record<string, number>,
       difficultNodePfs: {} as Record<string, number[]>,
+    }
+
+    if (connectionTraceWidthMap instanceof Map) {
+      this.connectionTraceWidthMap = new Map(connectionTraceWidthMap)
+    } else if (connectionTraceWidthMap) {
+      this.connectionTraceWidthMap = new Map(
+        Object.entries(connectionTraceWidthMap),
+      )
+    } else {
+      this.connectionTraceWidthMap = new Map()
     }
   }
 
@@ -162,6 +192,9 @@ export class HighDensitySolver extends BaseSolver {
     if (hyperParameters?.MULTI_HEAD_POLYLINE_SOLVER) {
       return "MultiHeadPolyLineIntraNodeSolver3"
     }
+    if (hyperParameters?.SINGLE_LAYER_NO_DIFFERENT_ROOT_INTERSECTIONS) {
+      return "SingleLayerNoDifferentRootIntersectionsIntraNodeSolver"
+    }
     if (hyperParameters?.CLOSED_FORM_SINGLE_TRANSITION) {
       return "SingleTransitionIntraNodeSolver"
     }
@@ -206,6 +239,42 @@ export class HighDensitySolver extends BaseSolver {
   }
 
   /**
+   * Compute the effective trace width for a given node. If all port points in
+   * the node belong to the same connection that has a nominalTraceWidth, use
+   * that. Otherwise fall back to the global traceWidth.
+   *
+   * For nodes with mixed connections we use the maximum requested width so that
+   * the wider trace gets the space it needs (the TraceWidthSolver will narrow
+   * traces that don't fit later).
+   */
+  private getTraceWidthForNode(node: NodeWithPortPoints): number {
+    if (this.connectionTraceWidthMap.size === 0) {
+      return this.traceWidth
+    }
+
+    let maxWidth = this.traceWidth
+    const seen = new Set<string>()
+
+    for (const portPoint of node.portPoints) {
+      const key = portPoint.rootConnectionName ?? portPoint.connectionName
+      if (seen.has(key)) continue
+      seen.add(key)
+
+      const byName = this.connectionTraceWidthMap.get(portPoint.connectionName)
+      const byRoot = portPoint.rootConnectionName
+        ? this.connectionTraceWidthMap.get(portPoint.rootConnectionName)
+        : undefined
+
+      const w = byName ?? byRoot
+      if (w !== undefined && w > maxWidth) {
+        maxWidth = w
+      }
+    }
+
+    return maxWidth
+  }
+
+  /**
    * Each iteration, pop an unsolved node and attempt to find the routes inside
    * of it.
    */
@@ -233,158 +302,59 @@ export class HighDensitySolver extends BaseSolver {
       if (this.failedSolvers.length > 0) {
         this.solved = false
         this.failed = true
-        // debugger
-        this.error = `Failed to solve ${this.failedSolvers.length} nodes, ${this.failedSolvers.slice(0, 5).map((fs) => fs.nodeWithPortPoints.capacityMeshNodeId)}. err0: ${this.failedSolvers[0].error}.`
-        this.updateCacheStats()
-        return
+      } else {
+        this.solved = true
       }
-
-      this.solved = true
-      this.updateCacheStats()
       return
     }
-    const node = this.unsolvedNodePortPoints.pop()!
 
-    this.activeSubSolver = new HyperSingleIntraNodeSolver({
+    const node = this.unsolvedNodePortPoints.shift()!
+    const nodeTraceWidth = this.getTraceWidthForNode(node)
+    const nodePf = this.nodePfById.get(node.capacityMeshNodeId) ?? null
+
+    const cache = getGlobalInMemoryCache()
+
+    this.activeSubSolver = new CachedIntraNodeRouteSolver({
       nodeWithPortPoints: node,
       colorMap: this.colorMap,
       connMap: this.connMap,
       viaDiameter: this.viaDiameter,
-      traceWidth: this.traceWidth,
+      traceWidth: nodeTraceWidth,
+      obstacleMargin: this.obstacleMargin,
       effort: this.effort,
+      nodePf: nodePf ?? undefined,
+      cache,
+      connectionTraceWidthMap: this.connectionTraceWidthMap,
     })
-    this.updateCacheStats()
   }
 
-  private updateCacheStats() {
-    const cacheProvider = getGlobalInMemoryCache()
-    this.stats.intraNodeCacheHits = cacheProvider.cacheHits
-    this.stats.intraNodeCacheMisses = cacheProvider.cacheMisses
-  }
+  override visualize(): GraphicsObject {
+    const visualizations: GraphicsObject[] = []
 
-  visualize(): GraphicsObject {
-    let graphics: GraphicsObject = {
-      lines: [],
-      points: [],
-      rects: [],
-      circles: [],
-    }
-    for (const route of this.routes) {
-      // Merge segments based on z-coordinate
-      const mergedSegments = mergeRouteSegments(
-        route.route,
-        route.connectionName,
-        this.colorMap[route.connectionName],
-      )
+    for (const [capacityMeshNodeId, metadata] of this.nodeSolveMetadataById) {
+      const node = metadata.node
+      const color =
+        metadata.status === "solved"
+          ? safeTransparentize("green", 0.9)
+          : safeTransparentize("red", 0.9)
 
-      // Add merged segments to graphics
-      for (const segment of mergedSegments) {
-        graphics.lines!.push({
-          points: segment.points,
-          label: segment.connectionName,
-          strokeColor:
-            segment.z === 0
-              ? segment.color
-              : safeTransparentize(segment.color, 0.75),
-          layer: `z${segment.z}`,
-          strokeWidth: route.traceThickness,
-          strokeDash: segment.z !== 0 ? "10, 5" : undefined,
-        })
-      }
-      for (const via of route.vias) {
-        graphics.circles!.push({
-          center: via,
-          layer: "z0,1",
-          radius: route.viaDiameter / 2,
-          fill: this.colorMap[route.connectionName],
-          label: `${route.connectionName} via`,
-        })
-      }
-    }
-    if (this.solved || this.failed) {
-      for (const [capacityMeshNodeId, metadata] of this.nodeSolveMetadataById) {
-        const left = metadata.node.center.x - metadata.node.width / 2
-        const right = metadata.node.center.x + metadata.node.width / 2
-        const top = metadata.node.center.y - metadata.node.height / 2
-        const bottom = metadata.node.center.y + metadata.node.height / 2
-
-        const label = this.createNodeMarkerLabel(capacityMeshNodeId, metadata)
-
-        graphics.lines!.push(
+      visualizations.push({
+        rects: [
           {
-            points: [
-              { x: left, y: top },
-              { x: right, y: top },
-            ],
-            layer: "hd_node_boundaries",
-            strokeColor: "red",
-            strokeDash: "6, 4",
-            strokeWidth: 0.03,
-            label,
+            center: node.center,
+            width: node.width,
+            height: node.height,
+            color,
+            label: this.createNodeMarkerLabel(capacityMeshNodeId, metadata),
           },
-          {
-            points: [
-              { x: right, y: top },
-              { x: right, y: bottom },
-            ],
-            layer: "hd_node_boundaries",
-            strokeColor: "red",
-            strokeDash: "6, 4",
-            strokeWidth: 0.03,
-            label,
-          },
-          {
-            points: [
-              { x: right, y: bottom },
-              { x: left, y: bottom },
-            ],
-            layer: "hd_node_boundaries",
-            strokeColor: "red",
-            strokeDash: "6, 4",
-            strokeWidth: 0.03,
-            label,
-          },
-          {
-            points: [
-              { x: left, y: bottom },
-              { x: left, y: top },
-            ],
-            layer: "hd_node_boundaries",
-            strokeColor: "red",
-            strokeDash: "6, 4",
-            strokeWidth: 0.03,
-            label,
-          },
-        )
+        ],
+      })
+    }
 
-        if (metadata.status === "solved") {
-          graphics.points!.push({
-            x: metadata.node.center.x,
-            y: metadata.node.center.y,
-            color: "red",
-            layer: "hd_node_markers",
-            label,
-          })
-        } else {
-          const rectWidth = Math.max(metadata.node.width * 0.1, 0.12)
-          const rectHeight = Math.max(metadata.node.height * 0.1, 0.12)
-          graphics.rects!.push({
-            center: metadata.node.center,
-            layer: "hd_node_markers",
-            width: rectWidth,
-            height: rectHeight,
-            fill: "red",
-            label,
-          })
-        }
-      }
-    }
-    if (this.activeSubSolver) {
-      graphics = combineVisualizations(
-        graphics,
-        this.activeSubSolver.visualize(),
-      )
-    }
-    return graphics
+    const routeVisualization = combineVisualizations(
+      ...(this.routes.map((r) => mergeRouteSegments([r])) ?? []),
+    )
+
+    return combineVisualizations(routeVisualization, ...visualizations)
   }
 }
