@@ -159,6 +159,8 @@ export class NetToPointPairsSolver2_OffBoardConnection extends NetToPointPairsSo
         ...currentConnection,
         pointsToConnect: optimizedConnection.pointsToConnect,
         rootConnectionName: currentConnection.name,
+        // Propagate nominalTraceWidth so downstream solvers can use it
+        nominalTraceWidth: currentConnection.nominalTraceWidth,
       })
       return
     }
@@ -182,6 +184,8 @@ export class NetToPointPairsSolver2_OffBoardConnection extends NetToPointPairsSo
         rootConnectionName: currentConnection.name,
         mergedConnectionNames: currentConnection.mergedConnectionNames,
         netConnectionName: currentConnection.netConnectionName,
+        // Propagate nominalTraceWidth so downstream solvers can use it
+        nominalTraceWidth: currentConnection.nominalTraceWidth,
       })
     }
   }
